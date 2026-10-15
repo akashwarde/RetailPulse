@@ -44,3 +44,16 @@ Warehouse batch inputs represent complete date snapshots. Online rows represent
 increments and require `event_id`. Online replay is ignored by its unique key;
 late events retain their actual event date. Fact-load lookup failures are written
 to PostgreSQL quarantine atomically with accepted facts.
+
+## Streaming contract (`orders_stream`)
+Required: `event_id`, `order_id`, `customer_id`, `product_id`, positive integral `quantity`, positive finite `unit_price`,
+parseable `event_time`. Valid events go to `bronze/online_orders/dt=<event date>/part-<batch>.parquet` (file name derives from
+Kafka offsets, so replays overwrite instead of duplicating). Invalid events go to `quarantine/online_orders/...`, `dq.quarantine`
+and the `orders_dlq` topic (envelope: reason + original payload). Late events are accepted. Silver de-duplicates on `event_id`;
+the warehouse loads through `load_fact_sales(channel="online")`, which never deletes older facts.
+
+## Quality gates
+Batch: reject % above `QUALITY_GATE_THRESHOLD` (default 5) raises `QualityGateError`; the summary row is still persisted.
+Stream: above `STREAM_QUALITY_THRESHOLD` (15) on at least `STREAM_GATE_MIN_MESSAGES` (50) messages fails `quality_gate`
+after the valid events have already been loaded.
+

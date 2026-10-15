@@ -32,6 +32,7 @@ from retailpulse.validation import (
     INVENTORY_RULES,
     ValidationRule,
     calculate_quality_summary,
+    get_quality_threshold,
     quality_gate,
     validate,
     write_quality_summary,
@@ -214,7 +215,7 @@ def run_silver_inventory(
     )
 
     # Quality Gate (default 5.0% threshold)
-    quality_gate(summary, threshold=5.0)
+    quality_gate(summary, threshold=get_quality_threshold())
 
     # Silver transformation
     silver_df = transform_inventory(good_df)

@@ -9,7 +9,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pyarrow as pa
-from minio.error import S3Error
+from minio.error import InvalidResponseError, S3Error
 from psycopg2.extras import RealDictCursor
 
 from retailpulse.common.config import AppConfig, get_config
@@ -89,8 +89,10 @@ def extract_inventory(run_date: str, data_dir: str | Path | None = None,
             lake.stat_object(cfg.minio.bucket, bronze)
             return dict(source="inventory", run_date=run_date, rows=prior[0]["rows"],
                         path=bronze, batch_id=f"inventory_{run_date}", skipped=True)
-    except S3Error as exc:
-        if exc.code not in ("NoSuchKey", "NoSuchObject"):
+    except (S3Error, InvalidResponseError) as exc:
+        # InvalidResponseError: some S3 look-alikes answer a missing key with an HTML 404
+        missing = exc.code in ("NoSuchKey", "NoSuchObject") if isinstance(exc, S3Error) else "NoSuchKey" in str(exc)
+        if not missing:
             raise
     required = ["product_id", "store_id", "stock_qty", "snapshot_date"]
     aliases = {"productid": "product_id", "storeid": "store_id", "stock_quantity": "stock_qty", "date": "snapshot_date"}

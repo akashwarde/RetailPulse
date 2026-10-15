@@ -2,6 +2,7 @@ name: retailpulse
 
 include:
   - compose.streaming.yml
+  - compose.bi.yml
 
 x-airflow-common: &airflow-common
   build:
@@ -27,11 +28,24 @@ x-airflow-common: &airflow-common
     MINIO_BUCKET: ${MINIO_BUCKET:-retailpulse}
     DATA_DIR: /opt/airflow/data/source
     REDPANDA_BROKER: redpanda:9092
+    RETAILPULSE_SQL_DIR: /opt/airflow/sql
+    ALERT_LOG_PATH: /opt/airflow/logs/alerts.log
+    ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    QUALITY_GATE_THRESHOLD: ${QUALITY_GATE_THRESHOLD:-5}
+    STREAM_QUALITY_THRESHOLD: ${STREAM_QUALITY_THRESHOLD:-15}
+    METABASE_URL: http://metabase:3000
+    METABASE_ADMIN_EMAIL: ${METABASE_ADMIN_EMAIL:-admin@retailpulse.local}
+    METABASE_ADMIN_PASSWORD: ${METABASE_ADMIN_PASSWORD:-RetailPulse-Admin-2026}
+    # Spark runs in local mode inside the task; keep it small so 8 GB laptops cope
+    PYSPARK_SUBMIT_ARGS: "--driver-memory 1g --conf spark.ui.enabled=false --conf spark.sql.shuffle.partitions=4 pyspark-shell"
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "4"
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./src:/opt/airflow/src
     - ./sql:/opt/airflow/sql:ro
+    - ./dashboards:/opt/airflow/dashboards
     - ./data:/opt/airflow/data
     - ./tests:/opt/airflow/tests:ro
   user: "${AIRFLOW_UID:-50000}:0"
@@ -50,12 +64,12 @@ services:
       POSTGRES_DB: ${SOURCE_DB}
       WAREHOUSE_DB: ${WAREHOUSE_DB:-warehouse_db}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5

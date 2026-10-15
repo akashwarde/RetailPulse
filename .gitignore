@@ -17,3 +17,4 @@ data/
 # Generated and local-only files
 *.backup
 *:Zone.Identifier
+smoke.log

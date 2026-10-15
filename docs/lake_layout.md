@@ -207,3 +207,12 @@ retailpulse/ (MinIO Bucket)
         └── dt=2025-01-15/
             └── data.parquet
 ```
+
+---
+
+## Streaming additions
+`bronze|silver|quarantine/online_orders/dt=YYYY-MM-DD/part-<batch>.parquet` - one file per micro-batch, named from Kafka offsets
+so a retry reuses the same object. Bronze batch files carry `_ingested_at`, `_batch_id`, `_source_file` (inventory also keeps a
+`manifest.parquet` fingerprint beside its partition). Inventory dates may arrive as `YYYY-MM-DD`, `DD/MM/YYYY` or `MM/DD/YYYY`;
+ambiguous slash dates are read day-first.
+

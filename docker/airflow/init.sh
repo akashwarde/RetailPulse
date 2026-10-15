@@ -7,3 +7,5 @@ if ! airflow users list --output json | python -c 'import json,sys; sys.exit(0 i
     airflow users create --username admin --password "${AIRFLOW_ADMIN_PASSWORD}" \
         --firstname RetailPulse --lastname Admin --role Admin --email admin@example.com
 fi
+# At most 2 Spark jobs at once (local-mode Spark is memory hungry)
+airflow pools set spark 2 "Concurrent local Spark jobs"
