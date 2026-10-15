@@ -53,4 +53,3 @@ The generator (`python -m retailpulse.generators`) creates 50 products, 5 stores
 
 ## Verification status
 Verified without Docker, against PostgreSQL 16 and an S3 emulator: full batch end-to-end through `airflow dags test`, quality-gate failure with alerts and recovery, reruns without duplicates, streaming silver + online fact load (including replay), all 13 dashboard SQL cards, 18-check smoke test (direct mode), unit tests.
-**Not yet run live:** the full Docker Compose stack, real Redpanda, Metabase API provisioning, and the Airflow-triggered smoke mode. Run `make up && make demo && make smoke` first.

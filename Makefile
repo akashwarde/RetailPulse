@@ -4,7 +4,7 @@ COMPOSE  := docker compose
 PROFILES := --profile core --profile streaming --profile bi
 AF       := $(COMPOSE) exec -T airflow-scheduler
 # yesterday's date (GNU date on Linux/WSL, BSD date on macOS)
-RUN_DATE ?= $(shell date -d yesterday +%F 2>/dev/null || date -v-1d +%F)
+RUN_DATE ?= $(shell date -u -d yesterday +%F 2>/dev/null || date -u -v-1d +%F)
 DAYS     ?= 30
 ORDERS   ?= $(shell echo $$(( $(DAYS) * 250 )))
 # unique microseconds so a manual run never collides with the scheduler's own run for the same date
