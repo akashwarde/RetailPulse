@@ -1,3 +1,4 @@
+import pyspark.sql.functions as F
 """Unit tests for the RetailPulse configuration-driven validation engine."""
 
 from datetime import datetime, timedelta
@@ -355,6 +356,7 @@ class TestRuleEngine:
             ["order_id", "customer_id", "quantity", "unit_price", "order_timestamp", "order_item_id"],
         )
 
+        df = df.withColumn("product_id", F.lit(1)).withColumn("store_id", F.lit(1))
         rules = get_source_rules("sales")
         good_df, bad_df = validate(df, rules)
 
@@ -392,6 +394,7 @@ class TestRuleEngine:
         ]
         df = spark.createDataFrame(data, ["customer_id", "first_name", "city", "email"])
 
+        df = df.withColumn("signup_date", F.lit("2024-01-01"))
         rules = get_source_rules("customers")
         good_df, bad_df = validate(df, rules)
 

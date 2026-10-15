@@ -123,6 +123,7 @@ class ValidationRule:
         columns: Union[str, Sequence[str]],
         name: Optional[str] = None,
         keep: str = "first",
+        order_by: Optional[List[str]] = None,
     ) -> ValidationRule:
         """Create a UNIQUE constraint rule over one or more columns."""
         cols = [columns] if isinstance(columns, str) else list(columns)
@@ -131,7 +132,7 @@ class ValidationRule:
             name=rule_name,
             rule_type=RuleType.UNIQUE,
             columns=cols,
-            params={"keep": keep},
+            params={"keep": keep, "order_by": order_by or []},
         )
 
     @classmethod
@@ -201,7 +202,16 @@ class ValidationRule:
 # Predefined source validation rules per RetailPulse specification
 SALES_RULES: List[ValidationRule] = [
     ValidationRule.not_null("order_id", name="not_null:order_id"),
+    ValidationRule.not_null("order_item_id"),
     ValidationRule.not_null("customer_id", name="not_null:customer_id"),
+    ValidationRule.not_null("product_id"),
+    ValidationRule.not_null("store_id"),
+    ValidationRule.regex("order_id", r"^[1-9][0-9]*$", name="format:order_id_integer"),
+    ValidationRule.regex("order_item_id", r"^[1-9][0-9]*$", name="format:order_item_id_integer"),
+    ValidationRule.regex("store_id", r"^[1-9][0-9]*$", name="format:store_id_integer"),
+    ValidationRule.regex("quantity", r"^[1-9][0-9]*$", name="format:quantity_integer"),
+    ValidationRule.regex("product_id", r"^[1-9][0-9]*$", name="format:product_id_integer"),
+    ValidationRule.regex("customer_id", r"^[1-9][0-9]*$", name="format:customer_id_integer"),
     ValidationRule.range(
         "quantity",
         min_val=1,
@@ -211,8 +221,8 @@ SALES_RULES: List[ValidationRule] = [
     ValidationRule.range(
         "unit_price",
         min_val=0.0,
-        inclusive_min=True,
-        name="range:unit_price_non_negative",
+        inclusive_min=False,
+        name="range:unit_price_positive",
     ),
     ValidationRule.range(
         "order_timestamp",
@@ -222,12 +232,16 @@ SALES_RULES: List[ValidationRule] = [
     ValidationRule.unique(
         ["order_id", "order_item_id"],
         name="unique:order_id,order_item_id",
+        keep="last", order_by=["order_timestamp", "_ingested_at"],
     ),
 ]
 
 INVENTORY_RULES: List[ValidationRule] = [
     ValidationRule.not_null("product_id", name="not_null:product_id"),
     ValidationRule.not_null("store_id", name="not_null:store_id"),
+    ValidationRule.regex("stock_qty", r"^[0-9]+$", name="format:stock_integer"),
+    ValidationRule.regex("product_id", r"^[1-9][0-9]*$", name="format:product_id_integer"),
+    ValidationRule.regex("store_id", r"^[1-9][0-9]*$", name="format:store_id_integer"),
     ValidationRule.range(
         "stock_qty",
         min_val=0,
@@ -242,13 +256,16 @@ INVENTORY_RULES: List[ValidationRule] = [
     ValidationRule.unique(
         ["product_id", "store_id", "snapshot_date"],
         name="unique:inventory_snapshot",
+        keep="last", order_by=["_ingested_at"],
     ),
 ]
 
 CUSTOMERS_RULES: List[ValidationRule] = [
     ValidationRule.not_null("customer_id", name="not_null:customer_id"),
+    ValidationRule.regex("customer_id", r"^[1-9][0-9]*$", name="format:customer_id_integer"),
     ValidationRule.not_null("first_name", name="not_null:first_name"),
     ValidationRule.not_null("city", name="not_null:city"),
+    ValidationRule.range("signup_date", max_val="today", name="range:signup_date_not_future"),
     ValidationRule.regex(
         "email",
         pattern=r"^[\w\.-]+@[\w\.-]+\.\w+$",
@@ -257,6 +274,7 @@ CUSTOMERS_RULES: List[ValidationRule] = [
     ValidationRule.unique(
         ["customer_id"],
         name="unique:customer_id",
+        keep="last", order_by=["signup_date", "_ingested_at"],
     ),
 ]
 

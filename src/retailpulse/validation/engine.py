@@ -68,6 +68,8 @@ def validate(
         ValueError: If a rule references a column that does not exist in `df`.
     """
     rule_list = _normalize_rules(rules)
+    # Evaluate content checks before choosing the survivor of duplicate keys.
+    rule_list.sort(key=lambda rule: rule.rule_type == RuleType.UNIQUE)
     original_cols = df.columns
     spark = df.sparkSession
 
@@ -103,7 +105,7 @@ def validate(
 
         if rtype == RuleType.NOT_NULL:
             assert col_name is not None
-            inv_cond = F.col(col_name).isNull()
+            inv_cond = F.col(col_name).isNull() | (F.trim(F.col(col_name).cast("string")) == "")
             reason_expr = F.lit(f"Column '{col_name}' is null")
 
         elif rtype == RuleType.RANGE:
@@ -114,11 +116,13 @@ def validate(
             inc_max = params.get("inclusive_max", True)
 
             range_conds = []
+            is_temporal = str(max_val).lower() in ("now", "today", "current_date", "current_timestamp")
+            value = F.to_timestamp(F.col(col_name)) if is_temporal else F.col(col_name).cast("double")
             if min_val is not None:
                 min_expr = (
-                    (F.col(col_name) < min_val)
+                    (value < min_val)
                     if inc_min
-                    else (F.col(col_name) <= min_val)
+                    else (value <= min_val)
                 )
                 range_conds.append(min_expr)
 
@@ -134,9 +138,9 @@ def validate(
                     max_expr = F.to_timestamp(F.col(col_name)) > F.current_timestamp()
                 else:
                     max_expr = (
-                        (F.col(col_name) > max_val)
+                        (value > max_val)
                         if inc_max
-                        else (F.col(col_name) >= max_val)
+                        else (value >= max_val)
                     )
                 range_conds.append(max_expr)
 
@@ -145,9 +149,11 @@ def validate(
                 combined_range = range_conds[0]
                 for rc in range_conds[1:]:
                     combined_range = combined_range | rc
-                inv_cond = F.col(col_name).isNull() | combined_range
+                inv_cond = value.isNull() | combined_range
             else:
-                inv_cond = F.col(col_name).isNull()
+                inv_cond = value.isNull()
+            if not is_temporal:
+                inv_cond = inv_cond | F.isnan(value) | (F.abs(value) == F.lit(float("inf")))
 
             if is_future_check:
                 reason_expr = F.concat(
@@ -189,10 +195,25 @@ def validate(
             helper_col = f"__rp_rn_{idx}"
             temp_cols.append(helper_col)
 
-            # Keep first occurrence, flag subsequent as duplicate
+            keep = params.get("keep", "first")
+            if keep not in ("first", "last"):
+                raise ValueError("unique keep must be 'first' or 'last'")
+            invalid_score = F.lit(0)
+            for condition, _, _ in rule_evaluations:
+                invalid_score = invalid_score + F.when(condition, 1).otherwise(0)
+            ordering = [invalid_score.asc()]
+            for name in params.get("order_by", []):
+                if name in original_cols:
+                    ordering.append(F.col(name).desc_nulls_last() if keep == "last" else F.col(name).asc_nulls_last())
+            # Stable tie-breaking independent of Spark partition/input ordering.
+            ordering.extend(
+                F.col(c).cast("string").desc_nulls_last() if keep == "last"
+                else F.col(c).cast("string").asc_nulls_last()
+                for c in sorted(original_cols)
+            )
             window_spec = Window.partitionBy(
                 [F.col(c) for c in unique_cols]
-            ).orderBy(F.lit(1))
+            ).orderBy(*ordering)
             working_df = working_df.withColumn(
                 helper_col, F.row_number().over(window_spec)
             )

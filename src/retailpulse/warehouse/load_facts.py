@@ -1,47 +1,18 @@
-"""Warehouse fact loading pipeline for RetailPulse.
-
-Loads Silver sales and inventory records from MinIO into the PostgreSQL star schema
-fact tables (dw.fact_sales, dw.fact_inventory).
-
-Architecture & Design Choices:
-------------------------------
-1. Surrogate Key Resolution:
-   - Look up surrogate keys from dimension tables:
-     - product_key from dw.dim_product(product_id)
-     - customer_key from dw.dim_customer(customer_id)
-     - store_key from dw.dim_store(store_id) (nullable for online orders, mandatory for in-store)
-     - date_key from dw.dim_date(full_date)
-   - Rows failing dimension lookups are skipped, logged as missing dimensions,
-     and counted in the load result.
-
-2. Dynamic Date Dimension Extension:
-   - For every distinct date present in incoming transactions or snapshots,
-     ensure_date_key is invoked to guarantee that dates outside the baseline
-     2024–2025 range exist in dw.dim_date prior to fact loading.
-
-3. Idempotency (Delete-and-Reload):
-   - fact_sales: Uses atomic delete-and-reload by date_key and channel so rerunning
-     a batch replaces existing facts without duplication or cross-channel interference.
-   - fact_inventory: Uses upsert matching
-     CONSTRAINT uq_fact_inventory UNIQUE (date_key, product_key, store_key).
-
-4. Robust Transaction Handling & Error Isolation:
-   - All database modifications execute in transaction blocks.
-   - On database error, conn.rollback() is explicitly executed before re-raising.
-   - Missing lake partitions (NoSuchKey) are handled gracefully, while unexpected
-     I/O or authentication errors are re-raised.
+"""Warehouse loads with date replacement for batch snapshots and event-id
+replay protection for online increments. Rejections are persisted in the same
+transaction as accepted facts; missing source partitions fail explicitly.
 """
 
 from __future__ import annotations
 
 import math
+from decimal import Decimal
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import pyarrow as pa
 import psycopg2
-from minio.error import S3Error
 from psycopg2.extras import execute_batch
 
 if TYPE_CHECKING:
@@ -56,6 +27,7 @@ from retailpulse.common.lake import (
     read_parquet,
 )
 from retailpulse.common.logging import get_logger
+from retailpulse.common.records import persist_rejections
 from retailpulse.warehouse.load_dimensions import ensure_date_key
 
 logger = get_logger("warehouse.load_facts")
@@ -139,452 +111,171 @@ def _parse_date_and_timestamp(raw_val: Any) -> Tuple[Optional[date], Optional[da
         pass
 
     try:
-        dt = datetime.strptime(val_str[:19], "%Y-%m-%d %H:%M:%S")
-        return dt.date(), dt
-    except ValueError:
-        pass
-
-    try:
-        d = datetime.strptime(val_str[:10], "%Y-%m-%d").date()
+        d = date.fromisoformat(val_str)
         return d, datetime.combine(d, datetime.min.time())
     except ValueError:
         return None, None
 
 
-def _is_missing_lake_object(exc: Exception) -> bool:
-    """Check whether an exception indicates a missing object or empty partition."""
-    if isinstance(exc, S3Error) and exc.code in ("NoSuchKey", "NoSuchBucket"):
-        return True
-    exc_msg = str(exc).lower()
-    return "nosuchkey" in exc_msg or "not found" in exc_msg or "does not exist" in exc_msg
+def _records(source: str, data: Optional[Union[pa.Table, Sequence[Dict[str, Any]]]],
+             run_date: Optional[str], minio_client: Optional[Minio],
+             bucket: Optional[str]) -> Tuple[List[Dict[str, Any]], str]:
+    """Read an explicitly supplied snapshot; missing required objects fail."""
+    if data is not None:
+        return (data.to_pylist() if isinstance(data, pa.Table) else list(data)), "in_memory"
+    if run_date is None or minio_client is None or bucket is None:
+        raise ValueError("Provide data or run_date, minio_client and bucket")
+    path = build_lake_path("silver", source, run_date)
+    return read_parquet(minio_client, bucket, path).to_pylist(), path
+
+
+def _integer(value: Any, name: str) -> int:
+    number = Decimal(str(value))
+    if not number.is_finite() or number != number.to_integral_value():
+        raise ValueError(f"{name} must be an integer")
+    return int(number)
+
+
+def _lookup(mapping: Dict[int, int], value: Any, name: str) -> int:
+    key = mapping.get(_integer(value, name))
+    if key is None:
+        raise ValueError(f"missing dimension: {name}={value}")
+    return key
+
+
+def _rejection(row: Dict[str, Any], reason: Exception) -> Dict[str, Any]:
+    # JSONB rejects NaN/Inf. Keep malformed values as strings in raw payload.
+    clean = {k: str(v) if isinstance(v, float) and not math.isfinite(v) else v for k, v in row.items()}
+    return dict(rule_failed="warehouse:invalid_record", reason=str(reason), raw_record=clean)
 
 
 def load_fact_sales(
-    conn: PgConnection,
-    data: Optional[Union[pa.Table, Sequence[Dict[str, Any]]]] = None,
-    run_date: Optional[str] = None,
-    minio_client: Optional[Minio] = None,
-    bucket: Optional[str] = None,
-    channel: Optional[str] = None,
+    conn: PgConnection, data: Optional[Union[pa.Table, Sequence[Dict[str, Any]]]] = None,
+    run_date: Optional[str] = None, minio_client: Optional[Minio] = None,
+    bucket: Optional[str] = None, channel: Optional[str] = None, batch_id: Optional[str] = None,
 ) -> FactLoadResult:
-    """Load Silver sales records into dw.fact_sales.
+    """Replace complete in-store dates; upsert online increments by event_id.
 
-    Idempotent: Uses atomic delete-and-reload by date_key and channel.
-    Resolves surrogate keys for date, product, customer, and store.
-
-    Args:
-        conn: Open psycopg2 database connection.
-        data: Optional in-memory PyArrow Table or list of dicts.
-        run_date: Partition date (YYYY-MM-DD) to read from MinIO if data not provided.
-        minio_client: Optional MinIO client for lake reads.
-        bucket: Lake bucket name.
-        channel: Optional channel override ('in_store' or 'online').
-
-    Returns:
-        FactLoadResult: Metrics on loaded, skipped, and quarantined records.
+    Online rows must include event_id. They never delete any date partition.
+    Rejections and accepted facts are written in the same database transaction.
     """
-    source_path = None
-    records: List[Dict[str, Any]] = []
-
-    if data is not None:
-        if isinstance(data, pa.Table):
-            records = data.to_pylist()
-        else:
-            records = list(data)
-        source_path = "in_memory"
-    elif run_date is not None and minio_client is not None and bucket is not None:
-        source_path = build_lake_path("silver", "sales", run_date)
+    records, source_path = _records("sales", data, run_date, minio_client, bucket)
+    lookups = fetch_dimension_lookups(conn) if records else {}
+    valid, rejected, physical_dates = [], [], set()
+    seen = set()
+    for row in records:
         try:
-            table = read_parquet(minio_client, bucket, source_path)
-            records = table.to_pylist()
-        except Exception as exc:
-            if _is_missing_lake_object(exc):
-                logger.warning("Silver sales partition not found at %s: %s", source_path, exc)
-                return FactLoadResult(
-                    fact_table="fact_sales",
-                    total_records=0,
-                    loaded=0,
-                    skipped=0,
-                    quarantined=0,
-                    source_path=source_path,
-                )
-            logger.error("Unexpected error reading Silver sales from %s: %s", source_path, exc)
-            raise
-
-    total_records = len(records)
-    if total_records == 0:
-        logger.info("No sales records to load.")
-        return FactLoadResult(
-            fact_table="fact_sales",
-            total_records=0,
-            loaded=0,
-            skipped=0,
-            quarantined=0,
-            source_path=source_path,
-        )
-
-    # 1. Fetch dimension lookups
-    lookups = fetch_dimension_lookups(conn)
-    prod_map = lookups["products"]
-    cust_map = lookups["customers"]
-    store_map = lookups["stores"]
-
-    # 2. Resolve distinct dates and ensure date dimension entries exist
-    dates_to_ensure: Set[date] = set()
-    for r in records:
-        ts_val = r.get("order_timestamp") or r.get("order_date") or run_date
-        d_val, _ = _parse_date_and_timestamp(ts_val)
-        if d_val:
-            dates_to_ensure.add(d_val)
-
-    if run_date:
-        run_d, _ = _parse_date_and_timestamp(run_date)
-        if run_d:
-            dates_to_ensure.add(run_d)
-
-    for d in dates_to_ensure:
-        ensure_date_key(conn, d)
-
-    # 3. Process, validate, and resolve surrogate keys
-    valid_params: List[tuple] = []
-    affected_date_keys: Set[int] = set()
-    skipped = 0
-
-    for r in records:
-        order_id = r.get("order_id")
-        product_id = r.get("product_id")
-        customer_id = r.get("customer_id")
-        store_id = r.get("store_id")
-        quantity = r.get("quantity")
-        unit_price = r.get("unit_price")
-        total_amount = r.get("total_amount")
-        order_item_id = r.get("order_item_id")
-        row_channel = channel or r.get("channel") or ("online" if store_id is None else "in_store")
-
-        # Mandatory natural keys check
-        if order_id is None or product_id is None or customer_id is None:
-            logger.warning("Skipping sales record missing mandatory IDs: %s", r)
-            skipped += 1
-            continue
-
-        raw_ts = r.get("order_timestamp") or r.get("order_date") or run_date
-        order_d, order_ts = _parse_date_and_timestamp(raw_ts)
-        if order_d is None or order_ts is None:
-            logger.warning("Skipping sales record with invalid timestamp/date: %s", r)
-            skipped += 1
-            continue
-
-        date_key = int(order_d.strftime("%Y%m%d"))
-
-        # Look up surrogate keys
-        try:
-            pid = int(product_id)
-            cid = int(customer_id)
-            product_key = prod_map.get(pid)
-            customer_key = cust_map.get(cid)
-        except (ValueError, TypeError):
-            logger.warning("Skipping sales record with non-integer natural keys: %s", r)
-            skipped += 1
-            continue
-
-        if product_key is None:
-            logger.warning("Product ID %d not found in dw.dim_product; skipping row: %s", pid, r)
-            skipped += 1
-            continue
-
-        if customer_key is None:
-            logger.warning("Customer ID %d not found in dw.dim_customer; skipping row: %s", cid, r)
-            skipped += 1
-            continue
-
-        store_key = None
-        if store_id is not None:
-            try:
-                sid = int(store_id)
-                store_key = store_map.get(sid)
-                if store_key is None and row_channel == "in_store":
-                    logger.warning("Store ID %d not found in dw.dim_store for in-store sale; skipping: %s", sid, r)
-                    skipped += 1
-                    continue
-            except (ValueError, TypeError):
-                if row_channel == "in_store":
-                    logger.warning("Invalid store_id %s for in-store sale; skipping: %s", store_id, r)
-                    skipped += 1
-                    continue
-        elif row_channel == "in_store":
-            # In-store sale must have a valid physical store
-            logger.warning("In-store sales record missing store_id; skipping: %s", r)
-            skipped += 1
-            continue
-
-        # Validate numeric measures (protecting against NaN / Inf / negative values)
-        try:
-            qty = int(quantity)
-            u_price = float(unit_price) if unit_price is not None else 0.0
-            if total_amount is not None:
-                rev = round(float(total_amount), 2)
-            else:
-                rev = round(qty * u_price, 2)
-
-            if (
-                qty <= 0
-                or u_price < 0
-                or rev < 0
-                or math.isnan(u_price)
-                or math.isinf(u_price)
-                or math.isnan(rev)
-                or math.isinf(rev)
-            ):
-                logger.warning(
-                    "Skipping sales record with invalid numeric measures (qty=%d, price=%s, rev=%s): %s",
-                    qty,
-                    u_price,
-                    rev,
-                    r,
-                )
-                skipped += 1
-                continue
-        except (ValueError, TypeError):
-            logger.warning("Skipping sales record with non-numeric measures: %s", r)
-            skipped += 1
-            continue
-
-        item_id = int(order_item_id) if order_item_id is not None else None
-        valid_params.append((
-            int(order_id),
-            item_id,
-            date_key,
-            product_key,
-            customer_key,
-            store_key,
-            qty,
-            u_price,
-            rev,
-            row_channel,
-            order_ts,
-        ))
-        affected_date_keys.add(date_key)
-
-    # 4. Idempotent delete-and-reload in a single atomic transaction block
-    if valid_params:
-        try:
-            with conn.cursor() as cur:
-                # Delete existing sales for the affected date keys and distinct channels present in batch
-                delete_query = """
-                DELETE FROM dw.fact_sales
-                WHERE date_key = ANY(%s) AND channel = %s;
-                """
-                distinct_channels = set(p[9] for p in valid_params)
-                for ch in distinct_channels:
-                    cur.execute(delete_query, (list(affected_date_keys), ch))
-                    logger.debug(
-                        "Deleted existing fact_sales for date_keys=%s, channel=%s (rows=%d)",
-                        affected_date_keys,
-                        ch,
-                        cur.rowcount,
-                    )
-
-                insert_query = """
-                INSERT INTO dw.fact_sales (
-                    order_id, order_item_id, date_key, product_key, customer_key, store_key,
-                    quantity, unit_price, revenue, channel, order_timestamp, created_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP);
-                """
-                execute_batch(cur, insert_query, valid_params, page_size=500)
-                conn.commit()
-        except Exception as exc:
-            conn.rollback()
-            logger.error("Database error during fact_sales load, rolled back: %s", exc)
-            raise
-
-    loaded = len(valid_params)
-    logger.info(
-        "fact_sales load complete: %d loaded, %d skipped of %d total",
-        loaded,
-        skipped,
-        total_records,
-    )
-    return FactLoadResult(
-        fact_table="fact_sales",
-        total_records=total_records,
-        loaded=loaded,
-        skipped=skipped,
-        quarantined=skipped,
-        source_path=source_path,
-    )
+            ch = channel or row.get("channel") or ("online" if row.get("store_id") is None else "in_store")
+            if ch not in ("in_store", "online"):
+                raise ValueError("Invalid channel")
+            event_id = row.get("event_id")
+            if ch == "online" and (not isinstance(event_id, str) or not event_id.strip()):
+                raise ValueError("Online events require event_id")
+            event_id = event_id.strip() if ch == "online" else None
+            order_id = _integer(row.get("order_id"), "order_id")
+            item_id = _integer(row["order_item_id"], "order_item_id") if row.get("order_item_id") is not None else None
+            day, timestamp = _parse_date_and_timestamp(row.get("order_timestamp") or row.get("event_time") or row.get("order_date") or run_date)
+            if day is None:
+                raise ValueError("Invalid sales timestamp")
+            if ch == "in_store" and run_date and day.isoformat() != run_date:
+                raise ValueError("In-store row is outside its snapshot date")
+            product = _lookup(lookups["products"], row.get("product_id"), "product_id")
+            customer = _lookup(lookups["customers"], row.get("customer_id"), "customer_id")
+            store = _lookup(lookups["stores"], row.get("store_id"), "store_id") if ch == "in_store" else None
+            qty = _integer(row.get("quantity"), "quantity")
+            price = Decimal(str(row.get("unit_price")))
+            if qty <= 0 or not price.is_finite() or price <= 0:
+                raise ValueError("Quantity and price must be finite and positive")
+            revenue = (price * qty).quantize(Decimal("0.01"))
+            if row.get("total_amount") is not None:
+                supplied = Decimal(str(row["total_amount"]))
+                if not supplied.is_finite() or supplied.quantize(Decimal("0.01")) != revenue:
+                    raise ValueError("Revenue does not match quantity * price")
+            identity = (ch, event_id) if ch == "online" else (ch, order_id, item_id)
+            if identity in seen:
+                continue  # replayed event/line inside this input
+            seen.add(identity)
+            date_key = int(day.strftime("%Y%m%d"))
+            ensure_date_key(conn, day)
+            valid.append((order_id, item_id, date_key, product, customer, store,
+                          qty, price, revenue, ch, timestamp, event_id))
+            if ch == "in_store":
+                physical_dates.add(date_key)
+        except (ValueError, TypeError, ArithmeticError) as exc:
+            rejected.append(_rejection(row, exc))
+    only_online = bool(records) and all(channel == "online" or r.get("channel") == "online" or r.get("event_id") for r in records)
+    if run_date and channel != "online" and not only_online:
+        # A corrected empty full-day snapshot must remove old physical facts.
+        physical_dates.add(int(date.fromisoformat(run_date).strftime("%Y%m%d")))
+    identity = batch_id or f"warehouse_sales_{run_date or 'input'}"
+    incremental = channel == "online" or any(r.get("channel") == "online" or r.get("event_id") for r in records)
+    try:
+        with conn.cursor() as cur:
+            if physical_dates:
+                cur.execute("DELETE FROM dw.fact_sales WHERE date_key = ANY(%s) AND channel = %s",
+                            (sorted(physical_dates), "in_store"))
+            if valid:
+                execute_batch(cur, """
+                    INSERT INTO dw.fact_sales (order_id, order_item_id, date_key, product_key,
+                        customer_key, store_key, quantity, unit_price, revenue, channel,
+                        order_timestamp, event_id, created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP)
+                    ON CONFLICT (event_id) DO NOTHING
+                """, valid, page_size=500)
+        persist_rejections(conn, "warehouse_sales", identity, rejected, replace=not incremental)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return FactLoadResult("fact_sales", len(records), len(valid), len(rejected), len(rejected), source_path)
 
 
 def load_fact_inventory(
-    conn: PgConnection,
-    data: Optional[Union[pa.Table, Sequence[Dict[str, Any]]]] = None,
-    run_date: Optional[str] = None,
-    minio_client: Optional[Minio] = None,
-    bucket: Optional[str] = None,
+    conn: PgConnection, data: Optional[Union[pa.Table, Sequence[Dict[str, Any]]]] = None,
+    run_date: Optional[str] = None, minio_client: Optional[Minio] = None,
+    bucket: Optional[str] = None, batch_id: Optional[str] = None,
 ) -> FactLoadResult:
-    """Load Silver inventory records into dw.fact_inventory.
-
-    Idempotent: Uses upsert matching CONSTRAINT uq_fact_inventory UNIQUE (date_key, product_key, store_key).
-    Resolves surrogate keys for date, product, and store.
-
-    Args:
-        conn: Open psycopg2 database connection.
-        data: Optional in-memory PyArrow Table or list of dicts.
-        run_date: Partition date (YYYY-MM-DD) to read from MinIO if data not provided.
-        minio_client: Optional MinIO client for lake reads.
-        bucket: Lake bucket name.
-
-    Returns:
-        FactLoadResult: Metrics on loaded, skipped, and quarantined records.
-    """
-    source_path = None
-    records: List[Dict[str, Any]] = []
-
-    if data is not None:
-        if isinstance(data, pa.Table):
-            records = data.to_pylist()
-        else:
-            records = list(data)
-        source_path = "in_memory"
-    elif run_date is not None and minio_client is not None and bucket is not None:
-        source_path = build_lake_path("silver", "inventory", run_date)
-        try:
-            table = read_parquet(minio_client, bucket, source_path)
-            records = table.to_pylist()
-        except Exception as exc:
-            if _is_missing_lake_object(exc):
-                logger.warning("Silver inventory partition not found at %s: %s", source_path, exc)
-                return FactLoadResult(
-                    fact_table="fact_inventory",
-                    total_records=0,
-                    loaded=0,
-                    skipped=0,
-                    quarantined=0,
-                    source_path=source_path,
-                )
-            logger.error("Unexpected error reading Silver inventory from %s: %s", source_path, exc)
-            raise
-
-    total_records = len(records)
-    if total_records == 0:
-        logger.info("No inventory records to load.")
-        return FactLoadResult(
-            fact_table="fact_inventory",
-            total_records=0,
-            loaded=0,
-            skipped=0,
-            quarantined=0,
-            source_path=source_path,
-        )
-
-    # 1. Fetch dimension lookups
-    lookups = fetch_dimension_lookups(conn)
-    prod_map = lookups["products"]
-    store_map = lookups["stores"]
-
-    # 2. Resolve distinct dates and ensure date dimension entries exist
-    dates_to_ensure: Set[date] = set()
-    for r in records:
-        d_raw = r.get("snapshot_date") or run_date
-        d_val, _ = _parse_date_and_timestamp(d_raw)
-        if d_val:
-            dates_to_ensure.add(d_val)
-
+    """Replace full inventory snapshots, including corrected empty snapshots."""
+    records, source_path = _records("inventory", data, run_date, minio_client, bucket)
+    lookups = fetch_dimension_lookups(conn) if records else {}
+    valid, rejected, dates = [], [], set()
+    seen = set()
     if run_date:
-        run_d, _ = _parse_date_and_timestamp(run_date)
-        if run_d:
-            dates_to_ensure.add(run_d)
-
-    for d in dates_to_ensure:
-        ensure_date_key(conn, d)
-
-    # 3. Process, validate, and resolve surrogate keys
-    valid_params: List[tuple] = []
-    skipped = 0
-
-    for r in records:
-        product_id = r.get("product_id")
-        store_id = r.get("store_id")
-        stock_qty = r.get("stock_qty")
-
-        if product_id is None or store_id is None or stock_qty is None:
-            logger.warning("Skipping inventory record missing mandatory fields: %s", r)
-            skipped += 1
-            continue
-
-        d_raw = r.get("snapshot_date") or run_date
-        snap_d, _ = _parse_date_and_timestamp(d_raw)
-        if snap_d is None:
-            logger.warning("Skipping inventory record with invalid snapshot_date: %s", r)
-            skipped += 1
-            continue
-
-        date_key = int(snap_d.strftime("%Y%m%d"))
-
+        dates.add(int(date.fromisoformat(run_date).strftime("%Y%m%d")))
+    for row in records:
         try:
-            pid = int(product_id)
-            sid = int(store_id)
-            qty = int(stock_qty)
-        except (ValueError, TypeError):
-            logger.warning("Skipping inventory record with non-integer fields: %s", r)
-            skipped += 1
-            continue
-
-        if qty < 0:
-            logger.warning("Skipping inventory record with negative stock_qty (%d): %s", qty, r)
-            skipped += 1
-            continue
-
-        product_key = prod_map.get(pid)
-        store_key = store_map.get(sid)
-
-        if product_key is None:
-            logger.warning("Product ID %d not found in dw.dim_product; skipping inventory: %s", pid, r)
-            skipped += 1
-            continue
-
-        if store_key is None:
-            logger.warning("Store ID %d not found in dw.dim_store; skipping inventory: %s", sid, r)
-            skipped += 1
-            continue
-
-        valid_params.append((date_key, product_key, store_key, qty))
-
-    # 4. Idempotent upsert matching CONSTRAINT uq_fact_inventory UNIQUE (date_key, product_key, store_key)
-    if valid_params:
-        try:
-            with conn.cursor() as cur:
-                upsert_query = """
-                INSERT INTO dw.fact_inventory (
-                    date_key, product_key, store_key, stock_qty, created_at
-                )
-                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-                ON CONFLICT (date_key, product_key, store_key) DO UPDATE SET
-                    stock_qty = EXCLUDED.stock_qty,
-                    created_at = CURRENT_TIMESTAMP;
-                """
-                execute_batch(cur, upsert_query, valid_params, page_size=500)
-                conn.commit()
-        except Exception as exc:
-            conn.rollback()
-            logger.error("Database error during fact_inventory load, rolled back: %s", exc)
-            raise
-
-    loaded = len(valid_params)
-    logger.info(
-        "fact_inventory load complete: %d loaded, %d skipped of %d total",
-        loaded,
-        skipped,
-        total_records,
-    )
-    return FactLoadResult(
-        fact_table="fact_inventory",
-        total_records=total_records,
-        loaded=loaded,
-        skipped=skipped,
-        quarantined=skipped,
-        source_path=source_path,
-    )
+            day, _ = _parse_date_and_timestamp(row.get("snapshot_date") or run_date)
+            if day is None or (run_date and day.isoformat() != run_date):
+                raise ValueError("Invalid inventory snapshot date")
+            qty = _integer(row.get("stock_qty"), "stock_qty")
+            if qty < 0:
+                raise ValueError("Stock cannot be negative")
+            product = _lookup(lookups["products"], row.get("product_id"), "product_id")
+            store = _lookup(lookups["stores"], row.get("store_id"), "store_id")
+            key = int(day.strftime("%Y%m%d"))
+            ensure_date_key(conn, day)
+            if (key, product, store) not in seen:
+                valid.append((key, product, store, qty))
+                seen.add((key, product, store))
+            dates.add(key)
+        except (ValueError, TypeError, ArithmeticError) as exc:
+            rejected.append(_rejection(row, exc))
+    try:
+        with conn.cursor() as cur:
+            if dates:
+                cur.execute("DELETE FROM dw.fact_inventory WHERE date_key = ANY(%s)", (sorted(dates),))
+            if valid:
+                execute_batch(cur, """
+                    INSERT INTO dw.fact_inventory (date_key, product_key, store_key, stock_qty)
+                    VALUES (%s,%s,%s,%s)
+                    ON CONFLICT (date_key, product_key, store_key) DO UPDATE SET stock_qty=EXCLUDED.stock_qty
+                """, valid, page_size=500)
+        persist_rejections(conn, "warehouse_inventory", batch_id or f"warehouse_inventory_{run_date or 'input'}", rejected)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return FactLoadResult("fact_inventory", len(records), len(valid), len(rejected), len(rejected), source_path)
 
 
 def load_facts(

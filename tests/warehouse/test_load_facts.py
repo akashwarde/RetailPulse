@@ -146,7 +146,7 @@ class TestLoadFactSales:
                 "unit_price": 250.0,
                 "total_amount": 250.0,
                 "order_timestamp": "2025-01-15 15:00:00",
-                "channel": "online",
+                "channel": "online", "event_id": "event-2002",
             }
         ]
 
@@ -194,7 +194,7 @@ class TestLoadFactSales:
         assert result.loaded == 0
         assert result.skipped == 1
 
-    def test_load_fact_sales_mixed_channels_deletes_both(
+    def test_load_fact_sales_mixed_channels_preserves_online(
         self, mocker: Any, mock_lookups: Any
     ) -> None:
         mock_conn = MagicMock()
@@ -226,7 +226,7 @@ class TestLoadFactSales:
                 "quantity": 1,
                 "unit_price": 100.0,
                 "order_timestamp": "2025-01-15 11:00:00",
-                "channel": "online",
+                "channel": "online", "event_id": "event-2002",
             },
         ]
 
@@ -239,7 +239,7 @@ class TestLoadFactSales:
         ]
         deleted_channels = {c[1] for c in delete_calls}
         assert "in_store" in deleted_channels
-        assert "online" in deleted_channels
+        assert "online" not in deleted_channels
 
     def test_load_fact_sales_nan_and_inf_rejected(
         self, mocker: Any, mock_lookups: Any
@@ -501,17 +501,9 @@ class TestLoadFactsOrchestrator:
         mock_cfg = MagicMock()
         mock_cfg.minio.bucket = "retailpulse"
 
-        results = load_facts(
-            run_date="2025-01-15",
-            config=mock_cfg,
-            minio_client=mock_minio,
-            conn=mock_conn,
-        )
-
-        assert "fact_sales" in results
-        assert "fact_inventory" in results
-        assert results["fact_sales"].loaded == 0
-        assert results["fact_inventory"].loaded == 0
+        with pytest.raises(Exception, match="not found"):
+            load_facts(run_date="2025-01-15", config=mock_cfg,
+                       minio_client=mock_minio, conn=mock_conn)
 
     def test_load_facts_unexpected_storage_error_reraised(
         self, mocker: Any
@@ -538,7 +530,7 @@ class TestLoadFactsOrchestrator:
         mock_minio = MagicMock()
         mocker.patch(
             "retailpulse.warehouse.load_facts.read_parquet",
-            side_effect=Exception("Lake object not found"),
+            return_value=pa.table({"order_id": []}),
         )
         mock_cfg = MagicMock()
         mock_cfg.minio.bucket = "retailpulse"

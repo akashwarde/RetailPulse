@@ -215,17 +215,8 @@ def load_dim_product(
         try:
             table = read_parquet(minio_client, bucket, source_path)
             records = table.to_pylist()
-        except Exception as exc:
-            logger.warning(
-                "Could not read Silver products from %s: %s", source_path, exc
-            )
-            return DimensionLoadResult(
-                dimension="dim_product",
-                total_records=0,
-                loaded=0,
-                skipped=0,
-                source_path=source_path,
-            )
+        except Exception:
+            raise
 
     total_records = len(records)
     valid_params: List[tuple] = []
@@ -324,17 +315,8 @@ def load_dim_customer(
         try:
             table = read_parquet(minio_client, bucket, source_path)
             records = table.to_pylist()
-        except Exception as exc:
-            logger.warning(
-                "Could not read Silver customers from %s: %s", source_path, exc
-            )
-            return DimensionLoadResult(
-                dimension="dim_customer",
-                total_records=0,
-                loaded=0,
-                skipped=0,
-                source_path=source_path,
-            )
+        except Exception:
+            raise
 
     total_records = len(records)
     valid_params: List[tuple] = []
@@ -433,17 +415,8 @@ def load_dim_store(
         try:
             table = read_parquet(minio_client, bucket, source_path)
             records = table.to_pylist()
-        except Exception as exc:
-            logger.warning(
-                "Could not read Silver stores from %s: %s", source_path, exc
-            )
-            return DimensionLoadResult(
-                dimension="dim_store",
-                total_records=0,
-                loaded=0,
-                skipped=0,
-                source_path=source_path,
-            )
+        except Exception:
+            raise
 
     total_records = len(records)
     valid_params: List[tuple] = []

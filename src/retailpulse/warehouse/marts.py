@@ -23,7 +23,7 @@ from retailpulse.common.logging import get_logger
 logger = get_logger("warehouse.marts")
 
 # Path to SQL mart definitions
-SQL_MARTS_DIR = Path("sql/marts")
+SQL_MARTS_DIR = Path(__file__).resolve().parents[3] / "sql" / "marts"
 
 
 def refresh_marts(conn: PgConnection, marts_dir: Optional[Union[str, Path]] = None) -> List[str]:
@@ -44,7 +44,7 @@ def refresh_marts(conn: PgConnection, marts_dir: Optional[Union[str, Path]] = No
     sql_files = sorted(directory.glob("*.sql"))
     if not sql_files:
         logger.warning("No SQL files found in %s", directory.resolve())
-        return executed
+        raise FileNotFoundError(f"No mart SQL files found in {directory.resolve()}")
 
     current_file: Optional[Path] = None
     try:

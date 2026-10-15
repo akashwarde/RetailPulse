@@ -1,18 +1,10 @@
 """Integration tests for warehouse data marts executing directly against PostgreSQL.
 
-Requires a reachable PostgreSQL instance (e.g. disposable test container).
-If no PostgreSQL instance is reachable, these tests are skipped cleanly.
+Set RETAILPULSE_TEST_DSN to a disposable PostgreSQL test server. Each test
+uses a fresh database and seeds its own rows; otherwise tests are skipped.
 """
 
-import os
-from typing import Generator
 import pytest
-
-try:
-    import psycopg2
-    PG_AVAILABLE = True
-except ImportError:
-    PG_AVAILABLE = False
 
 from retailpulse.warehouse.marts import (
     get_channel_performance,
@@ -24,47 +16,33 @@ from retailpulse.warehouse.marts import (
 )
 
 
-def _get_pg_conn():
-    """Attempt connection to test PostgreSQL instance."""
-    host = os.getenv("TEST_POSTGRES_HOST", os.getenv("POSTGRES_HOST", "temp_pg_test"))
-    port = int(os.getenv("TEST_POSTGRES_PORT", os.getenv("POSTGRES_PORT", "5432")))
-    user = os.getenv("TEST_POSTGRES_USER", os.getenv("POSTGRES_USER", "postgres"))
-    password = os.getenv("TEST_POSTGRES_PASSWORD", os.getenv("POSTGRES_PASSWORD", "secret"))
-    dbname = os.getenv("TEST_POSTGRES_DB", os.getenv("POSTGRES_DB", "postgres"))
-
-    errors = []
-    # Try configured host first, then localhost as fallback
-    for h in [host, "localhost", "127.0.0.1"]:
-        try:
-            conn = psycopg2.connect(
-                host=h,
-                port=port,
-                user=user,
-                password=password,
-                dbname=dbname,
-                connect_timeout=2,
-            )
-            return conn, None
-        except Exception as exc:
-            errors.append(f"{h}:{port} -> {exc}")
-    return None, "; ".join(errors)
-
-
-@pytest.fixture(scope="module")
-def pg_conn() -> Generator:
-    """Fixture providing a connected PostgreSQL connection or skipping if unavailable."""
-    if not PG_AVAILABLE:
-        pytest.skip("psycopg2 not installed")
-
-    conn, err = _get_pg_conn()
-    if conn is None:
-        pytest.skip(f"PostgreSQL test instance not reachable: {err}")
-
-    # Refresh marts
-    refresh_marts(conn)
-
-    yield conn
-    conn.close()
+@pytest.fixture
+def pg_conn(pg):
+    """Seed an isolated database rather than relying on a pre-existing warehouse."""
+    with pg.cursor() as cur:
+        cur.execute("""
+            INSERT INTO dw.dim_product(product_id,name,category,price) VALUES
+                (101,'Keyboard','Electronics',100),(102,'Mouse','Electronics',50),(103,'Cable','Accessories',15);
+            INSERT INTO dw.dim_customer(customer_id,first_name,city) VALUES (201,'Demo','Pune');
+            INSERT INTO dw.dim_store(store_id,store_name,city) VALUES (301,'Store A','Pune'),(302,'Store B','Mumbai');
+            INSERT INTO dw.fact_sales(order_id,order_item_id,date_key,product_key,customer_key,store_key,quantity,unit_price,revenue,channel,order_timestamp)
+            SELECT v.oid,v.line,20250115,p.product_key,c.customer_key,s.store_key,v.qty,v.price,v.qty*v.price,v.channel,'2025-01-15 10:00:00'::timestamp
+            FROM (VALUES (1,1,101,301,2,100,'in_store'),(2,1,102,302,1,50,'in_store'),
+                         (2,2,103,302,2,15,'in_store'),(3,1,101,NULL,1,100,'online'),
+                         (3,2,102,NULL,1,50,'online')) AS v(oid,line,pid,sid,qty,price,channel)
+            JOIN dw.dim_product p ON p.product_id=v.pid
+            CROSS JOIN dw.dim_customer c LEFT JOIN dw.dim_store s ON s.store_id=v.sid;
+            INSERT INTO dw.fact_inventory(date_key,product_key,store_key,stock_qty)
+            SELECT 20250115,p.product_key,s.store_key,v.qty
+            FROM (VALUES (101,301,0),(102,301,4),(103,301,8),(101,302,25)) AS v(pid,sid,qty)
+            JOIN dw.dim_product p ON p.product_id=v.pid JOIN dw.dim_store s ON s.store_id=v.sid;
+            INSERT INTO dq.summary(source,batch_id,total,accepted,rejected,reject_pct,per_rule_counts) VALUES
+                ('sales','sales_a',100,95,5,5,'{}'),('sales','sales_b',200,190,10,5,'{}'),
+                ('inventory','inv_a',50,50,0,0,'{}');
+        """)
+    pg.commit()
+    refresh_marts(pg)
+    return pg
 
 
 class TestMartsPostgresIntegration:

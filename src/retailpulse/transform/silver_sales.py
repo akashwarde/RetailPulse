@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 import pyarrow as pa
@@ -21,6 +20,7 @@ if TYPE_CHECKING:
     from minio import Minio
     from psycopg2.extensions import connection as PgConnection
 
+from retailpulse.transform.preparation import prepare, session, from_bronze
 from retailpulse.common.config import AppConfig, get_config
 from retailpulse.common.lake import (
     build_lake_path,
@@ -82,7 +82,7 @@ def transform_sales(
     Returns:
         DataFrame: Transformed, cleansed Silver sales records.
     """
-    if df.rdd.isEmpty():
+    if df.isEmpty():
         logger.info("Input sales DataFrame is empty; returning empty Silver DataFrame.")
         # Return empty DataFrame with correct silver schema
         empty_df = (
@@ -202,11 +202,11 @@ def run_silver_sales(
     logger.info("Starting Bronze->Silver sales transformation for date '%s'", run_date)
     cfg = config or get_config()
     minio_client = client or get_minio_client(cfg)
-    active_batch_id = batch_id or f"sales_{run_date}_{int(time.time())}"
-    validation_rules = rules or SALES_RULES
+    active_batch_id = batch_id or f"sales_{run_date}"
+    validation_rules = rules if rules is not None else SALES_RULES
 
     # 1. Initialize SparkSession
-    spark_session = spark or SparkSession.builder.appName("SilverSales").getOrCreate()
+    spark_session = spark or session("SilverSales")
 
     # 2. Read Bronze partition
     if source_df is not None:
@@ -215,12 +215,17 @@ def run_silver_sales(
         bronze_path = build_lake_path("bronze", "sales", dt=run_date, filename="data.parquet")
         logger.info("Reading Bronze sales from s3://%s/%s", cfg.minio.bucket, bronze_path)
         bronze_table = read_parquet(minio_client, cfg.minio.bucket, bronze_path)
-        bronze_df = spark_session.createDataFrame(bronze_table.to_pandas())
+        bronze_df = from_bronze(spark_session, bronze_table)
 
     total_records = bronze_df.count()
     logger.info("Read %d records from Bronze sales partition '%s'", total_records, run_date)
 
     # 3. Call validation engine
+    bronze_df = prepare(bronze_df, "sales")
+    if source_df is None:
+        masters = read_parquet(minio_client, cfg.minio.bucket, build_lake_path("silver", "products", run_date))
+        validation_rules = [*validation_rules, ValidationRule.referential("product_id",
+            ref_values=[str(r["product_id"]) for r in masters.to_pylist()])]
     good_df, bad_df = validate(bronze_df, validation_rules)
     good_count = good_df.count()
     bad_count = bad_df.count()
@@ -231,17 +236,16 @@ def run_silver_sales(
     )
 
     # 4. Quarantine invalid records
-    if bad_count > 0:
-        quarantine_count = write_quarantine(
-            bad_df=bad_df,
-            source="sales",
-            batch_id=active_batch_id,
-            dt=run_date,
-            client=minio_client,
-            conn=conn,
-            config=cfg,
-        )
-        logger.info("Quarantined %d rejected sales records", quarantine_count)
+    quarantine_count = write_quarantine(
+        bad_df=bad_df,
+        source="sales",
+        batch_id=active_batch_id,
+        dt=run_date,
+        client=minio_client,
+        conn=conn,
+        config=cfg,
+    )
+    logger.info("Quarantined %d rejected sales records", quarantine_count)
 
     # 5. Calculate and persist Data Quality summary
     summary = calculate_quality_summary(

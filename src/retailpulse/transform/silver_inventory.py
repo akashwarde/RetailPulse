@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 import pyarrow as pa
@@ -20,6 +19,7 @@ if TYPE_CHECKING:
     from minio import Minio
     from psycopg2.extensions import connection as PgConnection
 
+from retailpulse.transform.preparation import prepare, session, from_bronze
 from retailpulse.common.config import AppConfig, get_config
 from retailpulse.common.lake import (
     build_lake_path,
@@ -71,7 +71,8 @@ def transform_inventory(
     Returns:
         DataFrame: Transformed, cleansed Silver inventory records.
     """
-    if df.rdd.isEmpty():
+    df = prepare(df, "inventory")
+    if df.isEmpty():
         logger.info("Input inventory DataFrame is empty; returning empty Silver DataFrame.")
         empty_df = (
             df.withColumn("product_id", F.lit(0).cast(LongType()))
@@ -101,7 +102,10 @@ def transform_inventory(
 
     # Deduplicate on business keys
     keys = list(dedupe_keys) if dedupe_keys else ["product_id", "store_id", "snapshot_date"]
-    window_spec = Window.partitionBy([F.col(k) for k in keys]).orderBy(F.lit(1))
+    window_spec = Window.partitionBy([F.col(k) for k in keys]).orderBy(
+        *([F.col("_ingested_at").desc_nulls_last()] if "_ingested_at" in transformed.columns else []),
+        F.to_json(F.struct(*[F.col(c) for c in df.columns])).asc(),
+    )
     deduped = (
         transformed.withColumn("__rp_rn", F.row_number().over(window_spec))
         .filter(F.col("__rp_rn") == 1)
@@ -148,10 +152,10 @@ def run_silver_inventory(
     logger.info("Starting Bronze->Silver inventory transformation for date '%s'", run_date)
     cfg = config or get_config()
     minio_client = client or get_minio_client(cfg)
-    active_batch_id = batch_id or f"inventory_{run_date}_{int(time.time())}"
-    validation_rules = rules or INVENTORY_RULES
+    active_batch_id = batch_id or f"inventory_{run_date}"
+    validation_rules = rules if rules is not None else INVENTORY_RULES
 
-    spark_session = spark or SparkSession.builder.appName("SilverInventory").getOrCreate()
+    spark_session = spark or session("SilverInventory")
 
     if source_df is not None:
         bronze_df = source_df
@@ -159,12 +163,17 @@ def run_silver_inventory(
         bronze_path = build_lake_path("bronze", "inventory", dt=run_date, filename="data.parquet")
         logger.info("Reading Bronze inventory from s3://%s/%s", cfg.minio.bucket, bronze_path)
         bronze_table = read_parquet(minio_client, cfg.minio.bucket, bronze_path)
-        bronze_df = spark_session.createDataFrame(bronze_table.to_pandas())
+        bronze_df = from_bronze(spark_session, bronze_table)
 
     total_records = bronze_df.count()
     logger.info("Read %d records from Bronze inventory partition '%s'", total_records, run_date)
 
     # Validation
+    bronze_df = prepare(bronze_df, "inventory")
+    if source_df is None:
+        masters = read_parquet(minio_client, cfg.minio.bucket, build_lake_path("silver", "products", run_date))
+        validation_rules = [*validation_rules, ValidationRule.referential("product_id",
+            ref_values=[str(r["product_id"]) for r in masters.to_pylist()])]
     good_df, bad_df = validate(bronze_df, validation_rules)
     good_count = good_df.count()
     bad_count = bad_df.count()
@@ -175,17 +184,16 @@ def run_silver_inventory(
     )
 
     # Quarantine invalid records
-    if bad_count > 0:
-        quarantine_count = write_quarantine(
-            bad_df=bad_df,
-            source="inventory",
-            batch_id=active_batch_id,
-            dt=run_date,
-            client=minio_client,
-            conn=conn,
-            config=cfg,
-        )
-        logger.info("Quarantined %d rejected inventory records", quarantine_count)
+    quarantine_count = write_quarantine(
+        bad_df=bad_df,
+        source="inventory",
+        batch_id=active_batch_id,
+        dt=run_date,
+        client=minio_client,
+        conn=conn,
+        config=cfg,
+    )
+    logger.info("Quarantined %d rejected inventory records", quarantine_count)
 
     # Quality summary
     summary = calculate_quality_summary(
