@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import json
 import re
 from dataclasses import asdict, dataclass
@@ -294,6 +296,14 @@ def write_quality_summary(
             active_conn.close()
 
     return summary
+
+
+def get_quality_threshold(default: float = 5.0) -> float:
+    """Reject-percentage gate threshold; override with env ``QUALITY_GATE_THRESHOLD``."""
+    raw = os.getenv("QUALITY_GATE_THRESHOLD")
+    if raw is None or not raw.strip():
+        return default
+    return float(raw)  # ValueError on a malformed value: fail loudly rather than silently gate at 5
 
 
 def quality_gate(

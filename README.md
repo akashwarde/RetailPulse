@@ -1,101 +1,56 @@
-# RetailPulse
+# RetailPulse - end-to-end data engineering platform
 
-Batch and streaming retail analytics using PostgreSQL, MinIO, PySpark, Airflow,
-and Redpanda. The generator, batch extractors, silver transforms, warehouse loads,
-and SQL marts are implemented. Airflow DAGs, the stream consumer/DLQ workflow,
-and Metabase are still pending.
+Batch and streaming retail pipeline: **sources -> bronze/silver lake (MinIO, Parquet) -> PySpark validation -> PostgreSQL star schema -> Metabase**, orchestrated by **Airflow**, with a streaming path on **Redpanda (Kafka)**.
 
-## Run the batch components
-
-Use Docker Compose v2 with `include` support. On Windows use WSL2 and keep the
-checkout in the Linux filesystem; the commands below also work on macOS.
-
-```bash
-cp .env.example .env
-# Set the passwords and AIRFLOW_WEBSERVER_SECRET_KEY in .env.
-make up
-docker compose --profile core ps -a
-make generate
-# The generator ends yesterday by default. Use a generated date here.
-make batch DATE=2026-10-14
-make test
+```
+raw_sales (Postgres) -+                              +- quarantine (MinIO + dq.quarantine)
+Inventory CSVs -------+-> bronze -> PySpark silver -> quality gate -> dw star schema -> marts -> Metabase
+customers.json -------+                                   ^
+Order producer -> Redpanda -> consumer -> bronze/silver --+   (invalid events -> orders_dlq)
 ```
 
-Without Make, use `docker compose --profile core up -d --build`, then
-`docker compose --profile core exec airflow-scheduler python -m retailpulse.generators`.
-Run a date with `docker compose --profile core exec airflow-scheduler python -m retailpulse.pipeline YYYY-MM-DD`.
-The batch command executes Python components directly; scheduling will be added
-by the Airflow DAG work.
-
-Airflow initialization applies source/warehouse SQL and database migrations before
-the scheduler/webserver start. The MinIO initializer creates the lake bucket.
-Running initialization again is supported:
+## Quick start (Docker Compose v2; macOS, Linux, or Windows via WSL2)
 
 ```bash
-make init
+make env          # creates .env with random passwords
+make up           # Postgres, MinIO, Airflow, Redpanda, Metabase  (make up-lite = no streaming/BI)
+make wait         # until Airflow is healthy
+make demo         # init DB, 30 days of data with defects, batch DAG, streaming DAG, Metabase dashboard
+make smoke        # 18 end-to-end assertions
+make test         # unit tests inside the Airflow image
 ```
 
-For an existing database volume created before configurable database names were
-added, keep the original database names unless you create the replacement
-databases first. Initialization does not drop databases or recreate volumes.
-The retry-key migration consolidates duplicate DQ records for the same logical
-batch, retaining the most recently inserted duplicate.
-
-## Services
-
-| Service | Host address | Login |
+| Service | URL | Login |
 |---|---|---|
-| Airflow | http://localhost:8080 | admin / AIRFLOW_ADMIN_PASSWORD |
-| PostgreSQL | localhost:5432 | POSTGRES_USER / POSTGRES_PASSWORD |
-| MinIO API | http://localhost:9000 | MINIO_ROOT_USER / MINIO_ROOT_PASSWORD |
-| MinIO console | http://localhost:9001 | same MinIO credentials |
-| Redpanda Kafka | localhost:19092 | local development broker |
-| Redpanda console | http://localhost:8085 | local development console |
+| Airflow | http://localhost:8080 | admin / `AIRFLOW_ADMIN_PASSWORD` |
+| MinIO console | http://localhost:9001 | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` |
+| Redpanda console | http://localhost:8085 | - |
+| Metabase | http://localhost:3000 | `METABASE_ADMIN_EMAIL` / `METABASE_ADMIN_PASSWORD` |
+| PostgreSQL | localhost:5432 | `POSTGRES_USER` / `POSTGRES_PASSWORD` |
 
-Enable streaming infrastructure with
-`docker compose --profile core --profile streaming up -d --build`.
-Only the producer and broker/topic provisioning are implemented at this point.
+Useful targets: `make batch RUN_DATE=2026-10-14` (DAG run), `make batch-direct` (same stages without the scheduler),
+`make backfill DAYS=7`, `make init` (re-apply DDL on an existing volume), `make help`.
 
-## Sources and retry behavior
+## Failure demos
+- `make gate-demo` - regenerates the day with 20% defects; the quality gate fails the DAG, the failure is written to `dq.pipeline_events` and `logs/alerts.log` (and to a webhook if `ALERT_WEBHOOK_URL` is set).
+- `make recover` - regenerates clean data and re-runs; reruns are idempotent.
 
-The generator creates 50 products, 5 stores, 1,000 customer JSON records,
-20,000 sales rows over 90 days, and daily inventory CSVs. Use `--days`, `--orders`,
-`--defect-rate`, `--end-date`, `--seed`, or `--files-only` to customize it.
-The normalized source `customers`, `orders`, and `order_items` tables contain clean
-counterparts. `raw_sales` deliberately permits malformed copies that operational
-constraints would reject. It is the batch sales extraction source; see
-[data contracts](docs/data_contracts.md).
+## Pipeline summary
+- **Batch DAG `retail_batch_pipeline`** (daily): `extract_masters` + per-source `extract -> to_silver` (Spark pool of 2) -> `load_dimensions` -> `load_facts` -> `refresh_marts`; `write_dq_summary` always runs (`all_done`).
+- **Stream DAG `retail_stream_microbatch`** (every 5 min, one active run): consume -> short-circuit if nothing new -> silver -> `load_fact_sales` (channel `online`, replay-safe on `event_id`) -> stream quality gate.
+- **Quality gates**: batch rejects above `QUALITY_GATE_THRESHOLD` (5%) fail the task; stream above `STREAM_QUALITY_THRESHOLD` (15%, min 50 messages).
+- **Idempotency**: in-store facts replace whole date snapshots; online facts are `ON CONFLICT (event_id)`; DQ rows are upserted per stable batch id.
+- **Delivery**: consumer commits Kafka offsets only after bronze, quarantine, DLQ and summary writes succeed.
 
-Extractors overwrite one bronze date partition. Inventory imports use content
-fingerprints and skip unchanged successful files. Products/stores are validated
-and published to bronze/silver before dimension loads.
+## Sources and retry behaviour
+The generator (`python -m retailpulse.generators`) creates 50 products, 5 stores, 1,000 customers, sales rows with injected defects, and daily inventory CSVs (`--days`, `--orders`, `--defect-rate`, `--end-date`, `--seed`, `--files-only`). `raw_sales` is a deliberately permissive landing table. Details in [data contracts](docs/data_contracts.md); lake paths in [lake layout](docs/lake_layout.md).
 
-Sales/inventory/customer silver jobs replace the same date partition and use stable
-logical batch IDs. DQ summaries are upserted and quarantine batches replaced.
-The 5% quality gate stops publication of a bad silver batch; a failure leaves the
-last successful silver partition available for inspection. Warehouse stages must
-run only after all current silver stages succeed.
-
-In-store sales and inventory loads replace complete date snapshots, including an
-explicitly empty corrected snapshot. Online sales are incremental: each event
-requires an `event_id`, and replay uses `ON CONFLICT DO NOTHING`. Online loads do
-not delete date partitions. Missing dimension lookups are persisted in PostgreSQL
-quarantine in the fact transaction. Load-result `loaded` counts accepted distinct
-input rows, including events already present during a replay.
+## Documentation
+[architecture](docs/architecture.md) - [data contracts](docs/data_contracts.md) - [runbook](docs/runbook.md) - [implementation notes](docs/implementation_notes.md) - [report/presentation outline](docs/report_and_presentation_outline.md)
 
 ## Tests
+`make test` (Docker) or `make test-local` (needs Java 17). Optional live PostgreSQL tests need `RETAILPULSE_TEST_DSN` pointing at a disposable server; each test creates and drops its own database.
 
-`make test` executes tests inside the Airflow image. Optional live database tests
-require `RETAILPULSE_TEST_DSN` pointing to a disposable test server with database
-creation permissions. Each test creates and removes its own database; production
-connections are not used by default. Example inside the Compose network:
-
-```bash
-docker compose --profile core exec \
-  -e RETAILPULSE_TEST_DSN='host=postgres user=retail password=YOUR_TEST_PASSWORD dbname=postgres' \
-  -e RETAILPULSE_TEST_MINIO=1 \
-  airflow-scheduler python -m pytest tests -q
-```
-
-See [implementation notes](docs/implementation_notes.md) for the completed scope,
-validation evidence, and the remaining work owned by the DAG/streaming/BI phases.
+## Verification status
+Verified without Docker, against PostgreSQL 16 and an S3 emulator: full batch end-to-end through `airflow dags test`, quality-gate failure with alerts and recovery, reruns without duplicates, streaming silver + online fact load (including replay), all 13 dashboard SQL cards, 18-check smoke test (direct mode), unit tests.
+**Not yet run live:** the full Docker Compose stack, real Redpanda, Metabase API provisioning, and the Airflow-triggered smoke mode. Run `make up && make demo && make smoke` first.

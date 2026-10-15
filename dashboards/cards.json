@@ -1,0 +1,39 @@
+{
+  "dashboard": {
+    "name": "RetailPulse Overview",
+    "description": "Revenue, products, stores, channels, stock alerts and data quality for the RetailPulse platform."
+  },
+  "cards": [
+    {"name": "Total revenue", "display": "scalar", "row": 0, "col": 0, "size_x": 6, "size_y": 3,
+     "sql": "SELECT COALESCE(SUM(revenue), 0) AS total_revenue FROM dw.fact_sales"},
+    {"name": "Orders", "display": "scalar", "row": 0, "col": 6, "size_x": 6, "size_y": 3,
+     "sql": "SELECT COUNT(DISTINCT order_id) AS orders FROM dw.fact_sales"},
+    {"name": "Average order value", "display": "scalar", "row": 0, "col": 12, "size_x": 6, "size_y": 3,
+     "sql": "SELECT ROUND(SUM(revenue) / NULLIF(COUNT(DISTINCT order_id), 0), 2) AS avg_order_value FROM dw.fact_sales"},
+    {"name": "Overall reject rate (%)", "display": "scalar", "row": 0, "col": 18, "size_x": 6, "size_y": 3,
+     "sql": "SELECT COALESCE(ROUND(SUM(total_rejected) * 100.0 / NULLIF(SUM(total_records), 0), 2), 0) AS reject_pct FROM dw.mart_dq_summary"},
+
+    {"name": "Revenue trend by day", "display": "line", "row": 3, "col": 0, "size_x": 16, "size_y": 6,
+     "sql": "SELECT full_date, SUM(total_revenue) AS revenue FROM dw.mart_daily_revenue GROUP BY full_date ORDER BY full_date"},
+    {"name": "Online vs in-store revenue", "display": "pie", "row": 3, "col": 16, "size_x": 8, "size_y": 6,
+     "sql": "SELECT channel, SUM(total_revenue) AS revenue FROM dw.mart_channel_performance GROUP BY channel"},
+
+    {"name": "Top 10 products by revenue", "display": "bar", "row": 9, "col": 0, "size_x": 12, "size_y": 6,
+     "sql": "SELECT product_name, total_revenue FROM dw.mart_top_products ORDER BY revenue_rank LIMIT 10"},
+    {"name": "Sales by category", "display": "bar", "row": 9, "col": 12, "size_x": 12, "size_y": 6,
+     "sql": "SELECT p.category, SUM(f.revenue) AS revenue FROM dw.fact_sales f JOIN dw.dim_product p ON p.product_key = f.product_key GROUP BY p.category ORDER BY revenue DESC"},
+
+    {"name": "Store performance", "display": "bar", "row": 15, "col": 0, "size_x": 12, "size_y": 6,
+     "sql": "SELECT store_name, SUM(total_revenue) AS revenue FROM dw.mart_channel_performance WHERE channel = 'in_store' GROUP BY store_name ORDER BY revenue DESC"},
+    {"name": "Low-stock alerts (latest snapshot)", "display": "table", "row": 15, "col": 12, "size_x": 12, "size_y": 6,
+     "sql": "SELECT product_name, store_name, stock_qty, stock_status FROM dw.mart_low_stock WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM dw.mart_low_stock) ORDER BY stock_qty, product_name LIMIT 25"},
+
+    {"name": "Data-quality scorecard", "display": "table", "row": 21, "col": 0, "size_x": 12, "size_y": 5,
+     "sql": "SELECT source, total_records, total_accepted, total_rejected, overall_reject_pct AS reject_pct FROM dw.mart_dq_summary ORDER BY source"},
+    {"name": "Rejected rows by rule", "display": "bar", "row": 21, "col": 12, "size_x": 12, "size_y": 5,
+     "sql": "SELECT source || ' / ' || rule_failed AS rule, COUNT(*) AS rows_rejected FROM dq.quarantine GROUP BY source, rule_failed ORDER BY rows_rejected DESC LIMIT 12"},
+
+    {"name": "Recent pipeline events", "display": "table", "row": 26, "col": 0, "size_x": 24, "size_y": 5,
+     "sql": "SELECT created_at, dag_id, task_id, status, LEFT(message, 140) AS message FROM dq.pipeline_events ORDER BY created_at DESC LIMIT 12"}
+  ]
+}

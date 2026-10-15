@@ -33,6 +33,7 @@ from retailpulse.validation import (
     SALES_RULES,
     ValidationRule,
     calculate_quality_summary,
+    get_quality_threshold,
     quality_gate,
     validate,
     write_quality_summary,
@@ -266,7 +267,7 @@ def run_silver_sales(
     )
 
     # 6. Evaluate Quality Gate (default 5.0% threshold)
-    quality_gate(summary, threshold=5.0)
+    quality_gate(summary, threshold=get_quality_threshold())
 
     # 7. Apply Silver transformations
     silver_df = transform_sales(good_df)
