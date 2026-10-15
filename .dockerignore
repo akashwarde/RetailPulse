@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+data
+logs
+__pycache__
+**/__pycache__
+.pytest_cache
+*.parquet

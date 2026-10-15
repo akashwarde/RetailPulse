@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, NamedTuple, Optional, Union
 
 from retailpulse.common.config import RedpandaConfig
+from retailpulse.generators.demo import CUSTOMER_COUNT, PRODUCT_COUNT
 
 
 class GeneratedOrderEvent(NamedTuple):
@@ -98,8 +99,8 @@ class OrderGenerator:
         data = {
             "event_id": event_id,
             "order_id": oid,
-            "customer_id": self.rng.randint(1, 5000),
-            "product_id": self.rng.randint(1, 200),
+            "customer_id": self.rng.randint(1, CUSTOMER_COUNT),
+            "product_id": self.rng.randint(1, PRODUCT_COUNT),
             "quantity": self.rng.randint(1, 10),
             "unit_price": round(self.rng.uniform(5.0, 499.0), 2),
             "event_time": now.isoformat(),
@@ -189,8 +190,8 @@ class OrderGenerator:
         data: Dict[str, Any] = {
             "event_id": event_id,
             "order_id": oid,
-            "customer_id": self.rng.randint(1, 5000),
-            "product_id": self.rng.randint(1, 200),
+            "customer_id": self.rng.randint(1, CUSTOMER_COUNT),
+            "product_id": self.rng.randint(1, PRODUCT_COUNT),
             "quantity": self.rng.randint(1, 10),
             "unit_price": round(self.rng.uniform(5.0, 499.0), 2),
             "event_time": now.isoformat(),

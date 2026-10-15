@@ -44,10 +44,9 @@ class PostgresConfig:
                 f"database must be 'source' or 'warehouse', got '{database}'"
             )
 
-        return (
-            f"dbname={dbname} host={self.host} port={self.port} "
-            f"user={self.user} password={self.password}"
-        )
+        from psycopg2.extensions import make_dsn
+        return make_dsn(dbname=dbname, host=self.host, port=self.port,
+                        user=self.user, password=self.password)
 
 
 @dataclass(frozen=True)

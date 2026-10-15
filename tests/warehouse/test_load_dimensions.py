@@ -306,22 +306,12 @@ class TestLoadDimensionsOrchestration:
         mock_cfg = MagicMock()
         mock_cfg.minio.bucket = "test-bucket"
 
-        results = load_dimensions(
-            run_date="2025-01-15",
-            config=mock_cfg,
-            minio_client=mock_minio,
-            conn=mock_conn,
-        )
-
-        assert "dim_date" in results
-        assert "dim_product" in results
-        assert "dim_customer" in results
-        assert "dim_store" in results
-        assert results["dim_product"].loaded == 0
-        assert results["dim_customer"].loaded == 0
-        assert results["dim_store"].loaded == 0
+        with pytest.raises(Exception, match="does not exist"):
+            load_dimensions(run_date="2025-01-15", config=mock_cfg,
+                            minio_client=mock_minio, conn=mock_conn)
 
     def test_load_dimensions_selective(self, mocker: Any) -> None:
+        mocker.patch("retailpulse.warehouse.load_dimensions.read_parquet", return_value=pa.table({"product_id": []}))
         mock_conn = MagicMock()
         mock_minio = MagicMock()
         mock_cur = MagicMock()

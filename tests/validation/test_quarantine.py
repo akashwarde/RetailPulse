@@ -191,7 +191,7 @@ class TestWriteQuarantine:
 
         mock_conn.commit.assert_called_once()
 
-    def test_write_quarantine_empty_does_nothing(self, spark: SparkSession) -> None:
+    def test_write_quarantine_empty_clears_previous_batch(self, spark: SparkSession) -> None:
         """When bad_df has zero records, no external writes occur."""
         schema = StructType([
             StructField("id", IntegerType(), True),
@@ -207,13 +207,15 @@ class TestWriteQuarantine:
             bad_df=bad_df,
             source="sales",
             batch_id="batch_000",
+            config=_make_config(),
             client=mock_client,
             conn=mock_conn,
         )
 
         assert written == 0
-        mock_client.put_object.assert_not_called()
-        mock_conn.cursor.assert_not_called()
+        mock_client.put_object.assert_called_once()
+        sql = mock_conn.cursor.return_value.__enter__.return_value.execute.call_args.args[0]
+        assert "DELETE FROM dq.quarantine" in sql
 
 
 class TestWriteQualitySummary:

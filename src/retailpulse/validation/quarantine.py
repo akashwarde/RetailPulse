@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -80,7 +81,7 @@ def calculate_quality_summary(
         for row in bad_df.select("rule_failed").collect():
             val = row["rule_failed"]
             if val:
-                for rule in str(val).split(","):
+                for rule in re.split(r",\s+(?=[a-z_]+:)", str(val)):
                     clean_rule = rule.strip()
                     if clean_rule:
                         per_rule_counts[clean_rule] = (
@@ -129,14 +130,6 @@ def write_quarantine(
         int: Number of bad records written to quarantine.
     """
     count = bad_df.count()
-    if count == 0:
-        logger.info(
-            "No rejected records to quarantine for source '%s' (batch '%s').",
-            source,
-            batch_id,
-        )
-        return 0
-
     cfg = config or get_config()
     target_bucket = bucket or cfg.minio.bucket
     date_str = (
@@ -157,6 +150,7 @@ def write_quarantine(
 
     # Convert Spark DataFrame to PyArrow Table
     pdf = bad_df.toPandas()
+    pdf = pdf.astype(object).where(pdf.notna(), None)
     arrow_table = pa.Table.from_pandas(pdf)
     write_parquet(minio_client, target_bucket, lake_path, arrow_table)
     logger.info(
@@ -171,7 +165,7 @@ def write_quarantine(
     records_to_insert = []
     for _, row in pdf.iterrows():
         raw_dict = {col: row[col] for col in payload_cols}
-        raw_json = json.dumps(raw_dict, default=str)
+        raw_json = json.dumps(raw_dict, default=str, allow_nan=False)
         records_to_insert.append((
             source,
             str(row.get("rule_failed", "")),
@@ -183,18 +177,20 @@ def write_quarantine(
     insert_sql = """
         INSERT INTO dq.quarantine (
             source, rule_failed, reason, batch_id, raw_record
-        ) VALUES (%s, %s, %s, %s, %s);
+        ) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING;
     """
 
     should_close_conn = False
     active_conn = conn
     if active_conn is None:
-        active_conn = get_connection(db_target=db_target, config=cfg)
+        active_conn = get_connection(database=db_target, config=cfg)
         should_close_conn = True
 
     try:
         with active_conn.cursor() as cur:
-            cur.executemany(insert_sql, records_to_insert)
+            cur.execute("DELETE FROM dq.quarantine WHERE source=%s AND batch_id=%s", (source, batch_id))
+            if records_to_insert:
+                cur.executemany(insert_sql, records_to_insert)
         if not active_conn.autocommit:
             active_conn.commit()
         logger.info(
@@ -202,6 +198,9 @@ def write_quarantine(
             len(records_to_insert),
             source,
         )
+    except Exception:
+        active_conn.rollback()
+        raise
     finally:
         if should_close_conn and not active_conn.closed:
             active_conn.close()
@@ -251,14 +250,18 @@ def write_quality_summary(
     insert_sql = """
         INSERT INTO dq.summary (
             source, batch_id, total, accepted, rejected, reject_pct, per_rule_counts
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s);
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (source, batch_id) DO UPDATE SET
+            total=EXCLUDED.total, accepted=EXCLUDED.accepted,
+            rejected=EXCLUDED.rejected, reject_pct=EXCLUDED.reject_pct,
+            per_rule_counts=EXCLUDED.per_rule_counts, created_at=CURRENT_TIMESTAMP;
     """
 
     cfg = config or get_config()
     should_close_conn = False
     active_conn = conn
     if active_conn is None:
-        active_conn = get_connection(db_target=db_target, config=cfg)
+        active_conn = get_connection(database=db_target, config=cfg)
         should_close_conn = True
 
     try:
@@ -283,6 +286,9 @@ def write_quality_summary(
             batch_id,
             reject_pct,
         )
+    except Exception:
+        active_conn.rollback()
+        raise
     finally:
         if should_close_conn and not active_conn.closed:
             active_conn.close()
