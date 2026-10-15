@@ -1,0 +1,78 @@
+name: retailpulse
+
+services:
+  redpanda:
+    profiles: ["streaming"]
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.18
+    container_name: retailpulse-redpanda
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+      - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster info || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redpanda-init:
+    profiles: ["streaming"]
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.18
+    container_name: retailpulse-redpanda-init
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      REDPANDA_BROKER: redpanda:9092
+    entrypoint: ["/bin/bash", "/scripts/init_topics.sh"]
+    volumes:
+      - ./docker/redpanda/init_topics.sh:/scripts/init_topics.sh:ro
+    restart: "no"
+
+  redpanda-console:
+    profiles: ["streaming"]
+    image: docker.redpanda.com/redpandadata/console:v2.8.2
+    container_name: retailpulse-redpanda-console
+    restart: unless-stopped
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8085:8080"
+
+  order-producer:
+    profiles: ["streaming"]
+    image: retailpulse-airflow:2.10.5
+    container_name: retailpulse-order-producer
+    restart: unless-stopped
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+    environment:
+      REDPANDA_BROKER: redpanda:9092
+      PYTHONPATH: /opt/retailpulse/src
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-placeholder}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-placeholder}
+      PRODUCER_RATE_PER_SEC: ${PRODUCER_RATE_PER_SEC:-5.0}
+      PRODUCER_INVALID_RATE: ${PRODUCER_INVALID_RATE:-0.03}
+      PRODUCER_LATE_RATE: ${PRODUCER_LATE_RATE:-0.02}
+    volumes:
+      - ./src:/opt/retailpulse/src
+    command: python -m retailpulse.ingestion.stream.order_producer
+
+volumes:
+  redpanda_data:

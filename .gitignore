@@ -1,0 +1,19 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+logs/
+*.log
+*.parquet
+data/
+.DS_Store
+
+# Local environment and secrets
+.env.*
+!.env.example
+
+# Generated and local-only files
+*.backup
+*:Zone.Identifier

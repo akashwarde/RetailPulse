@@ -1,0 +1,7 @@
+pyspark==3.5.4
+minio==7.2.15
+psycopg2-binary==2.9.10
+pandas==2.1.4
+pyarrow==19.0.0
+python-dotenv==1.0.1
+confluent-kafka==2.8.2

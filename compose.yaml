@@ -1,0 +1,116 @@
+name: retailpulse
+
+include:
+  - compose.streaming.yml
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  image: retailpulse-airflow:2.10.5
+  environment: &airflow-environment
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://retail:${POSTGRES_PASSWORD}@postgres:5432/airflow_db
+    AIRFLOW__WEBSERVER__SECRET_KEY: retailpulse-development-secret-change-before-sharing
+    AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./src:/opt/airflow/src
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    profiles: ["core"]
+    image: postgres:17.11-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${SOURCE_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  minio:
+    profiles: ["core"]
+    image: dappros/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  minio-init:
+    profiles: ["core"]
+    image: retailpulse-airflow:2.10.5
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET:-retailpulse}
+    entrypoint: ["python", "/scripts/create_bucket.py"]
+    volumes:
+      - ./docker/minio/create_bucket.py:/scripts/create_bucket.py:ro
+    restart: "no"
+
+  airflow-init:
+    profiles: ["core"]
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create --username admin --password "$${AIRFLOW_ADMIN_PASSWORD}" --firstname RetailPulse --lastname Admin --role Admin --email admin@example.com
+
+    restart: "no"
+
+  airflow-webserver:
+    profiles: ["core"]
+    <<: *airflow-common
+    command: webserver
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  airflow-scheduler:
+    profiles: ["core"]
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  postgres_data:
+  minio_data:
